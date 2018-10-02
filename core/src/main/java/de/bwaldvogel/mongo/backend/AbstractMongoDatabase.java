@@ -1,6 +1,7 @@
 package de.bwaldvogel.mongo.backend;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
@@ -8,6 +9,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -142,6 +146,8 @@ public abstract class AbstractMongoDatabase<P> implements MongoDatabase {
             return listCollections();
         } else if (command.equalsIgnoreCase("listIndexes")) {
             return listIndexes();
+        } else if (command.equalsIgnoreCase("aggregate")) {
+            return commandAggregate(command, query);
         } else {
             log.error("unknown query: {}", query);
         }
@@ -192,7 +198,8 @@ public abstract class AbstractMongoDatabase<P> implements MongoDatabase {
         return response;
     }
 
-    private synchronized MongoCollection<P> resolveOrCreateCollection(final String collectionName) throws MongoServerException {
+    private synchronized MongoCollection<P> resolveOrCreateCollection(final String collectionName)
+            throws MongoServerException {
         final MongoCollection<P> collection = resolveCollection(collectionName, false);
         if (collection != null) {
             return collection;
@@ -413,14 +420,14 @@ public abstract class AbstractMongoDatabase<P> implements MongoDatabase {
         if (it.hasNext()) {
             String subCommand = it.next();
             switch (subCommand) {
-                case "w":
-                    // ignore
-                    break;
-                case "fsync":
-                    // ignore
-                    break;
-                default:
-                    throw new MongoServerException("unknown subcommand: " + subCommand);
+            case "w":
+                // ignore
+                break;
+            case "fsync":
+                // ignore
+                break;
+            default:
+                throw new MongoServerException("unknown subcommand: " + subCommand);
             }
         }
 
@@ -503,6 +510,117 @@ public abstract class AbstractMongoDatabase<P> implements MongoDatabase {
         return limitNumber != null ? limitNumber.intValue() : defaultValue;
     }
 
+    private List<Document> processPipelineMatch(Document step, List<Document> input) {
+        return input.stream().filter(doc -> {
+            try {
+                System.out.println("Step=" + step.toString() + " doc=" + doc.toString() + " Result="
+                        + matcher.matchesValue(step, doc));
+                return matcher.matchesValue(step, doc);
+            } catch (MongoServerException mse) {
+                throw new RuntimeException(mse);
+            }
+        }).collect(Collectors.toList());
+    }
+
+    private final QueryMatcher matcher = new DefaultQueryMatcher();
+
+    private Object evalGroup(Document data, List<Document> input) {
+        if (data.keySet().size() != 1) {
+            throw new IllegalStateException("Group should have one operator!");
+        } else {
+            String operator = data.keySet().iterator().next();
+            Object value = data.get(operator);
+            switch (operator) {
+            case "$sum":
+                if (value instanceof Long) {
+                    return ((Long) value).longValue() * input.size();
+                } else if (value instanceof Integer) {
+                    return ((Long) value).intValue() * input.size();
+                } else if (value instanceof Double) {
+                    return ((Long) value).doubleValue() * input.size();
+                } else if (value instanceof String && ((String) value).startsWith("$")) {
+                    String fieldName = ((String) value).substring(1);
+                    List<Object> values = input.stream().map(doc -> doc.get(fieldName)).collect(Collectors.toList());
+                    if (values.stream().anyMatch(v -> v instanceof Double)) {
+                        return values.stream().mapToDouble(v -> ((Number) v).doubleValue()).sum();
+                    } else {
+                        return values.stream().mapToLong(v -> ((Number) v).longValue()).sum();
+                    }
+                } else {
+                    throw new UnsupportedOperationException(
+                            String.format("Illegal Type of value: %s", value.getClass().getSimpleName()));
+                }
+            default:
+                throw new UnsupportedOperationException(String.format("Not implemented operator: %s", operator));
+            }
+        }
+    }
+
+    private Document groupDocuments(Document step, List<Document> input) {
+        Document groupedDocument = new Document("_id", null);
+        step.remove("_id");
+        for (String key : step.keySet()) {
+            groupedDocument.put(key, evalGroup((Document) step.get(key), input));
+        }
+        return groupedDocument;
+    }
+
+    private List<Document> processPipelineGroup(Document step, List<Document> input) {
+        Object groupId = step.get("_id");
+        if (groupId != null) {
+            // TODO not implemented yet
+            return null;
+        } else {
+            return Arrays.asList(groupDocuments(step, input));
+        }
+    }
+
+    private List<Document> processPipeline(Document step, List<Document> input) {
+        if (step.keySet().size() != 1) {
+            throw new IllegalArgumentException("Pipeline step should have one field!");
+        }
+        String stepName = step.keySet().toArray()[0].toString();
+        switch (stepName) {
+        case "$match":
+            return processPipelineMatch((Document) step.get(stepName), input);
+        case "$group":
+            return processPipelineGroup((Document) step.get(stepName), input);
+        default:
+            throw new UnsupportedOperationException(String.format("Step not implemented yet! stepName=%s", stepName));
+        }
+    }
+
+    @SuppressWarnings({ "unchecked" })
+    private Document commandAggregate(String command, Document query) throws MongoServerException {
+        Document cursor = new Document();
+        cursor.put("id", Long.valueOf(0));
+        cursor.put("ns", getDatabaseName() + ".$cmd.listCollections");
+
+        List<Document> firstBatch = new ArrayList<>();
+        String collectionName = query.get(command).toString();
+        MongoCollection<P> collection = resolveCollection(collectionName, false);
+        if (collection != null) {
+            List<Document> inputs = new ArrayList<>();
+            collection.handleQuery(new Document(), 0, 0, null).forEach((Consumer<Document>) doc -> inputs.add(doc));
+            List<Document> results = inputs;
+            Object pipeline = query.get("pipeline");
+            if (pipeline != null) {
+                for (Document pipelineStep : (List<Document>) pipeline) {
+                    results = processPipeline(pipelineStep, results);
+                }
+            } else {
+                throw new IllegalStateException("Pipeline cannot be null!");
+            }
+            firstBatch.addAll(results);
+        }
+        cursor.put("firstBatch", firstBatch);
+
+        Document response = new Document();
+        response.put("cursor", cursor);
+        Utils.markOkay(response);
+        return response;
+    }
+
     @Override
     public Iterable<Document> handleQuery(MongoQuery query) throws MongoServerException {
         clearLastStatus(query.getChannel());
@@ -551,7 +669,8 @@ public abstract class AbstractMongoDatabase<P> implements MongoDatabase {
     }
 
     @Override
-    public synchronized MongoCollection<P> resolveCollection(String collectionName, boolean throwIfNotFound) throws MongoServerException {
+    public synchronized MongoCollection<P> resolveCollection(String collectionName, boolean throwIfNotFound)
+            throws MongoServerException {
         checkCollectionName(collectionName);
         MongoCollection<P> collection = collections.get(collectionName);
         if (collection == null && throwIfNotFound) {
@@ -662,9 +781,11 @@ public abstract class AbstractMongoDatabase<P> implements MongoDatabase {
         }
     }
 
-    protected abstract Index<P> openOrCreateUniqueIndex(String collectionName, String key, boolean ascending) throws MongoServerException;
+    protected abstract Index<P> openOrCreateUniqueIndex(String collectionName, String key, boolean ascending)
+            throws MongoServerException;
 
-    private void insertDocuments(final Channel channel, final String collectionName, final List<Document> documents) throws MongoServerException {
+    private void insertDocuments(final Channel channel, final String collectionName, final List<Document> documents)
+            throws MongoServerException {
         clearLastStatus(channel);
         try {
             if (collectionName.startsWith("system.")) {
@@ -681,7 +802,8 @@ public abstract class AbstractMongoDatabase<P> implements MongoDatabase {
         }
     }
 
-    private Document deleteDocuments(final Channel channel, final String collectionName, final Document selector, final int limit) throws MongoServerException {
+    private Document deleteDocuments(final Channel channel, final String collectionName, final Document selector,
+            final int limit) throws MongoServerException {
         clearLastStatus(channel);
         try {
             if (collectionName.startsWith("system.")) {
@@ -704,7 +826,7 @@ public abstract class AbstractMongoDatabase<P> implements MongoDatabase {
     }
 
     private Document updateDocuments(final Channel channel, final String collectionName, final Document selector,
-                                       final Document update, final boolean multi, final boolean upsert) throws MongoServerException {
+            final Document update, final boolean multi, final boolean upsert) throws MongoServerException {
         clearLastStatus(channel);
         try {
             if (collectionName.startsWith("system.")) {
@@ -763,7 +885,8 @@ public abstract class AbstractMongoDatabase<P> implements MongoDatabase {
         return collection;
     }
 
-    protected abstract MongoCollection<P> openOrCreateCollection(String collectionName, String idField) throws MongoServerException;
+    protected abstract MongoCollection<P> openOrCreateCollection(String collectionName, String idField)
+            throws MongoServerException;
 
     @Override
     public void drop() throws MongoServerException {
